@@ -1,0 +1,439 @@
+---
+title: "LIWC Analysis"
+output: html_document
+---
+```{r}
+library(tidyverse)
+library(readxl)
+library(magrittr)
+library(tidytext)
+library(topicmodels)
+library(tm)
+```
+```{r}
+d.0 <- read_csv("../data/final_raw/JTBD CSV Transcript v2.csv")
+```
+
+```{r}
+names(d.0)
+```
+```{r}
+f_ = "../data/final_raw/JTBD CSV Transcript v2.csv"
+text_column = grep('ALL QUOTES', names(d.0))
+id_column = grep('PARTICIPANT ID', names(d.0))
+
+(cmd_ = paste0(
+  'liwc-22-cli -m wc ',
+  '--input ', shQuote(f_), ' ',
+  '--output ', '../results/liwc_output/liwc_default_dictionary_scores.csv ',
+  '--row-id-indices ', id_column, ' ',
+  '--column-indices ', text_column
+))
+# Run these through LIWC using the CLI
+system(cmd_)
+```
+# Process results
+
+1. The Summary scores are in rows `Analytic` through `Tone` with normed scores
+
+2. Other LIWC dictionary scores of interest (from TT docs) are in % of text format
+
+```{r}
+res.0 = read_csv("../results/liwc_output/liwc_default_dictionary_scores.csv") %>%
+  # Rename the Participant ID column to match the original data
+  select(`PARTICIPANT ID` = `Row ID`, everything())
+summary_df = res.0 %>%
+  select(`PARTICIPANT ID`, Analytic:Tone)
+scores_df = res.0 %>%
+  select(
+    `PARTICIPANT ID`,
+    Drives, affiliation, achieve, power,
+    Cognition, allnone:memory,
+    Affect, tone_pos:emo_sad,
+    # Others
+    focuspast,focuspresent,focusfuture,
+    leisure, work, money, wellness, tech, need, want, lack, visual, auditory, feeling
+  )
+```
+
+# Now use a custom dictionaries
+
+1. Personal Values Dictionary
+
+2. Brand personality
+
+```{r}
+pv_cmd_ = paste0(cmd_, ' ' , '--dictionary ../dictionaries/personal-values-dictionary.dicx')
+pv_cmd_ %<>% 
+  str_replace('--output.+_scores.csv', '--output ../results/liwc_output/personal-values_results.csv')
+bp_cmd_ = paste0(cmd_, ' ' , '--dictionary ../dictionaries/brand-personality-dictionary.dicx')
+bp_cmd_ %<>% 
+  str_replace('--output.+_scores.csv', '--output ../results/liwc_output/brand-personality_results.csv')
+pv_cmd_
+bp_cmd_
+```
+```{r}
+system(pv_cmd_)
+system(bp_cmd_)
+```
+
+```{r}
+pv_res = read_csv("../results/liwc_output/personal-values_results.csv") %>%
+  select(`PARTICIPANT ID` = `Row ID`, Dic:last_col()) %>%
+  select(-Dic, -AllPunc:-last_col())
+bp_res = read_csv("../results/liwc_output/brand-personality_results.csv") %>%
+  select(`PARTICIPANT ID` = `Row ID`, Dic:last_col())  %>%
+  select(-Dic, -AllPunc:-last_col())
+pv_res %>% head
+bp_res %>% head
+```
+
+# Merge all scores into master data frame
+```{r}
+df = reduce(
+  list(d.0 %>% select(`PARTICIPANT ID`, Segment), 
+       summary_df %>% rename_with(.fn = ~paste0('normed_', .), .cols = -1), 
+       scores_df,
+       pv_res %>% rename_with(.fn = ~paste0('pv_', .), .cols = -1),
+       bp_res %>% rename_with(.fn = ~paste0('bp_', .), .cols = -1)
+  ),
+  left_join
+) %>%
+  mutate(across(Segment, factor))
+
+levels(df$Segment)
+
+write.csv(df, "../results/LIWC-master_raw.csv", row.names = F)
+```
+
+# For each feature, run an anova using segment
+```{r}
+fit_anova = function(X) {
+  return(list(lm(X ~ df$Segment)))
+}
+
+get_f_stat = function(lm_) {
+  summary(lm_)$fstatistic[1]
+}
+
+get_f_pvalue = function(lm_) {
+  fstat <- summary(lm_)$fstatistic
+  pf(fstat[1], fstat[2], fstat[3], lower.tail = F)
+}
+
+get_signif = function(p_) {
+  p_ < .05
+}
+
+# The next one will be unnest wider afterward
+get_group_descriptives = function(lm_, group_) {
+  mod_mat <- lm_$model
+  list(
+    M = mean(mod_mat[mod_mat[,2] == group_, 1]),
+    SE = sd(mod_mat[mod_mat[,2] == group_, 1]) / sqrt(sum(mod_mat[,2] == group_))
+  )
+}
+
+analysis_res = df %>%
+  select(-`PARTICIPANT ID`, -Segment) %>%
+  pivot_longer(everything(), names_to = 'variable', values_to = 'data_') %>%
+  summarise(across(data_, fit_anova), .by = variable) %>%
+  rowwise() %>%
+  mutate(
+    f = get_f_stat(data_),
+    p = get_f_pvalue(data_),
+    adjusted_p_bonf = p.adjust(p, 'bonf', ncol(df) - 2), # create placeholder
+    adjusted_p_signif = p < .05, # Also placeholder
+    Consumer = list(get_group_descriptives(data_, 'Consumer')),
+    PC = list(get_group_descriptives(data_, 'PC')),
+    Server = list(get_group_descriptives(data_, 'Server')),
+    Storage = list(get_group_descriptives(data_, 'Storage'))
+  ) %>%
+  unnest_wider(col = c(Consumer, PC, Server, Storage),
+               names_sep = '_') %>%
+  mutate(across(adjusted_p_bonf, ~p.adjust(p, 'bonf', ncol(df) - 2)),
+         across(adjusted_p_signif, ~(adjusted_p_bonf < .05))) %>%
+  arrange(desc(abs(f)))
+```   
+```{r}
+write.csv(analysis_res %>% select(-data_), "../results/unfiltered_segment-ANOVA.csv", row.names = F)
+```
+
+
+# Plot
+```{r}
+plt.dat = analysis_res %>%
+    #filter(p < .05) # For unadjusted
+    filter(adjusted_p_signif) %>% # could also use above
+    mutate(across(variable, ~factor(., levels = .))) %>%
+    select(variable, contains('_M'), contains('_SE')) %>%
+    pivot_longer(-variable, names_to = 'stat', values_to = 'estimate') %>%
+    mutate(Segment = factor(str_replace(stat, '_.+$', ''), 
+                            levels = rev(c("Consumer", "PC", "Server", "Storage"))),
+           across(stat, ~str_replace(., '^.+_', ''))) %>%
+    pivot_wider(id_cols = c(Segment, variable), names_from = stat, values_from = estimate) %>%
+    mutate(conf_upr = M + 1.96*SE, conf_lwr = M - 1.96*SE)
+
+plt.dat %>%
+  ggplot(aes(x = M)) +
+  geom_col(aes(y = Segment, fill = Segment)) +
+  geom_errorbar(aes(y = Segment, xmax = conf_upr, xmin = conf_lwr),
+                width = .15) +
+  facet_wrap(~variable, scales = 'free_x') +
+  theme_bw(base_size = 14) +
+  ylab('') +
+  xlab('Mean LIWC Score') +
+  ggtitle(label = 'LIWC Features that significantlyª distinguished segment groups',
+          subtitle = 'ªSignificance determined after adjusting p-values') +
+  theme(plot.title.position = 'plot',
+        plot.title = element_text(hjust = .5),
+        plot.subtitle = element_text(hjust = .5)) +
+  guides(fill = guide_legend(reverse = T))
+  
+ggsave("../plots/LIWC-Scores_ANOVA-facet-barplot.jpg",
+       units = 'in', device = 'jpg', height = 9, width = 13.5)
+```
+```{r}
+analysis_res %>%
+    filter(p < .05) %>% # For unadjusted
+    #filter(adjusted_p_signif) %>% # could also use above
+  mutate(across(variable, ~factor(., levels = .))) %>%
+    select(variable, contains('_M'), contains('_SE')) %>%
+    pivot_longer(-variable, names_to = 'stat', values_to = 'estimate') %>%
+    mutate(Segment = factor(str_replace(stat, '_.+$', ''), 
+                            levels = rev(c("Consumer", "PC", "Server", "Storage"))),
+           across(stat, ~str_replace(., '^.+_', ''))) %>%
+    pivot_wider(id_cols = c(Segment, variable), names_from = stat, values_from = estimate) %>%
+    mutate(conf_upr = M + 1.96*SE, conf_lwr = M - 1.96*SE) %>%
+
+#plt.dat %>%
+  ggplot(aes(x = M)) +
+  geom_col(aes(y = Segment, fill = Segment)) +
+  geom_errorbar(aes(y = Segment, xmax = conf_upr, xmin = conf_lwr),
+                width = .15) +
+  facet_wrap(~variable, scales = 'free_x') +
+  theme_bw(base_size = 14) +
+  ylab('') +
+  xlab('Mean LIWC Score') +
+  ggtitle(label = 'LIWC Features that significantly distinguished segment groups') +
+  theme(plot.title.position = 'plot',
+        plot.title = element_text(hjust = .5),
+        plot.subtitle = element_text(hjust = .5)) +
+  guides(fill = guide_legend(reverse = T))
+  
+ggsave("../plots/UNADJUSTED-P_LIWC-Scores_ANOVA-facet-barplot.jpg",
+       units = 'in', device = 'jpg', height = 9, width = 13.5)
+```
+
+
+# One plot for each feature
+```{r}
+analysis_res %>%
+  filter(p < .05) %>%
+  mutate(across(variable, ~factor(., levels = .))) %>%
+  select(variable, contains('_M'), contains('_SE')) %>%
+  pivot_longer(-variable, names_to = 'stat', values_to = 'estimate') %>%
+  mutate(Segment = factor(str_replace(stat, '_.+$', ''), 
+                          levels = rev(c("Consumer", "PC", "Server", "Storage"))),
+         across(stat, ~str_replace(., '^.+_', ''))) %>%
+  pivot_wider(id_cols = c(Segment, variable), names_from = stat, values_from = estimate) %>%
+  mutate(conf_upr = M + 1.96*SE, conf_lwr = M - 1.96*SE) %>%
+  {
+    tmp <- .
+    variables = unique(tmp$variable)
+    walk(variables, \(v_) {
+      plt_dat_ = tmp %>%
+        select(Segment, M, starts_with('conf'), variable) %>%
+        filter(variable == v_)
+      ggplot(data = plt_dat_, aes(x = M)) +
+        geom_col(aes(y = Segment, fill = Segment)) +
+        geom_errorbar(aes(y = Segment, xmax = conf_upr, xmin = conf_lwr),
+                      width = .15) +
+        facet_wrap(~variable, scales = 'free_x') +
+        theme_bw(base_size = 14) +
+        ylab('') +
+        xlab('Mean LIWC Score') +
+        ggtitle(label = paste0('Group means for LIWC feature: ', v_)) +
+        theme(plot.title.position = 'plot',
+              plot.title = element_text(hjust = .5),
+              plot.subtitle = element_text(hjust = .5)) +
+        guides(fill = guide_legend(reverse = T))
+      ggsave(paste0("../plots/significant_features/", v_, '.jpg'),
+             units = 'in', device = 'jpg', height = 9 * .6667, width = 13.5 * .6667)
+    })
+    
+  }
+
+```
+
+
+
+
+# Contextualizing trust
+
+Taking the words surrounding trust, plot the top 5 most common words around it 
+for each group and overall.
+```{r}
+trust = read_csv("../data/liwc_raw/LIWC-22 Results - JTBD CSV Transcript v2 - Contextualizer.csv")
+segment_spine = d.0 %>%
+  select(`PARTICIPANT ID`, Segment) %>%
+  mutate(`Row ID` = row_number())
+trust_source_grouped = left_join(trust, segment_spine) %>%
+  summarise(across(`Context Left`, ~paste(., collapse = ' ')),
+            across(`Context Right`, ~paste(., collapse = ' ')),
+            .by = Segment) %>%
+  rowwise() %>%
+  mutate(context = paste(`Context Left`, `Context Right`, collapse = ' ')) %>%
+  select(Segment, context)
+trust_source_overall = left_join(trust, segment_spine) %>%
+  summarise(across(`Context Left`, ~paste(., collapse = ' ')),
+            across(`Context Right`, ~paste(., collapse = ' '))) %>%
+  rowwise() %>%
+  mutate(context = paste(`Context Left`, `Context Right`, collapse = ' ')) %>%
+  select(context)
+
+trust_dtm_grouped = DocumentTermMatrix(Corpus(VectorSource(trust_source_grouped$context)))
+trust_dtm_overall = DocumentTermMatrix(Corpus(VectorSource(trust_source_overall$context)))
+
+# trust counts per group
+(trust_counts = trust %>% 
+  summarise(trust_count = max(Observation),
+            .by = `Row ID`) %>%
+  left_join(segment_spine) %>%
+  summarise(trust_count = sum(trust_count), num_different_speakers = n(), .by = Segment))
+write.csv(trust_counts, "../results/trust-counts_grouped.csv", row.names = F)
+```
+
+```{r}
+data(stop_words)
+# Get top 10 words and plot frequencies
+imap(trust_source_grouped$Segment, function(g, i) {
+  dtm_ = as.matrix(trust_dtm_grouped)
+  terms_ = colnames(dtm_)
+  term_df_ = tibble(
+    group = g,
+    term = terms_,
+    count = as.vector(dtm_[i, ])
+  ) %>%
+    # Remove stop words
+    filter(!term %in% stop_words$word) %>%
+    arrange(desc(count)) %>%
+    slice(1:10) %>%
+    mutate(across(term, ~factor(., levels = rev(.))))
+  ggplot(term_df_) +
+    geom_col(aes(y = term, x = count, fill = term), show.legend = F) +
+    facet_grid(~group) +
+    #guides(fill = guide_legend(reverse = T)) +
+    theme_bw(base_size = 14) +
+    ylab('Word') +
+    xlab(paste0('Count across all participants in segment ', g)) +
+    ggtitle(label = paste0('Words most commonly associated with `trust` in segment ', g)) +
+    theme(plot.title.position = 'plot',
+          plot.title = element_text(hjust = .5),
+          plot.subtitle = element_text(hjust = .5)) +
+    guides(fill = guide_legend(reverse = T)) +
+  scale_x_continuous(breaks = 0:max(term_df_$count))
+  ggsave(paste0("../plots/trust/", g, '.jpg'),
+             units = 'in', device = 'jpg', height = 9 * .6667, width = 13.5 * .6667)
+})
+```
+
+overall trust
+```{r}
+overall_trust_plot_data = trust_dtm_overall %>% 
+  {
+    tmp <- .
+    dtm_ = as.matrix(tmp)
+    terms_ = colnames(dtm_)
+    tibble(
+      term = terms_,
+      count = as.vector(dtm_[1, ])
+    ) %>%
+      # Remove stop words
+      filter(!term %in% stop_words$word) %>%
+      arrange(desc(count)) %>%
+      slice(1:10) %>%
+      mutate(across(term, ~factor(., levels = rev(.))))
+  }
+  
+overall_trust_plot = ggplot(overall_trust_plot_data) +
+  geom_col(aes(y = term, x = count, fill = term), show.legend = F) +
+  #guides(fill = guide_legend(reverse = T)) +
+  theme_bw(base_size = 14) +
+  ylab('Word') +
+  xlab('Count') +
+  ggtitle(label = 'Words most commonly associated with `trust` in the study') +
+  theme(plot.title.position = 'plot',
+        plot.title = element_text(hjust = .5),
+        plot.subtitle = element_text(hjust = .5)) +
+  guides(fill = guide_legend(reverse = T)) +
+  scale_x_continuous(breaks = 0:max(overall_trust_plot_data$count))
+ggsave("../plots/trust/overall_trust-context.jpg", plot = overall_trust_plot,
+       units = 'in', device = 'jpg', height = 9 * .6667, width = 13.5 * .6667)
+```
+
+# LDA searching for themes
+Components in the data
+```{r}
+library(topicmodels)
+library(tm)
+library(tidytext)
+data("stop_words")
+#library(udpipe)
+# Read in raw counts and convert back to corpus
+df.raw = read_csv("../data/liwc_raw/LIWC-22 Results - jtbd_csv_transcript_v1_uk_aus - MEM Raw.csv") %>%
+  select(-`ALL QUOTES`:-RawTokenCount) %>%
+  # drop stop words
+  select(-any_of(stop_words$word))
+head(df.raw)
+```
+```{r}
+# The above is coercible to simple_triplet_matrix in same format as document-term matrices
+lda.models = lapply(as.character(2:6), \(x) {
+  LDA(df.raw, k = as.numeric(x))
+})
+# # Convert so it works wth
+# doc_term_freq = df.raw %>%
+#   mutate(doc_id = row_number()) %>%
+#   pivot_longer(-doc_id, names_to = 'term', values_to = 'freq')
+# 
+# dtm = udpipe::document_term_matrix(doc_term_freq)
+# view(df.raw)
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+
+plot_topics = function(lda_model) {
+  top_terms = tidy(lda_model) %>%
+    group_by(topic) %>%
+    slice_max(beta, n = 10) %>%
+    ungroup() %>%
+    arrange(topic, -beta)
+  
+  nt = n_distinct(top_terms$topic)
+  
+  top_terms %>%
+    mutate(term = reorder_within(term, beta, topic)) %>%
+    mutate(across(topic,~paste0('Theme ', .))) %>%
+    ggplot(aes(beta, term, fill = factor(topic))) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~topic, scales = "free") +
+    scale_y_reordered() +
+    theme_bw(base_size = 14) +
+    xlab('Relative importance of word to the theme') +
+    ylab('Word') +
+    ggtitle(label = 'Most salient topics across all participants') +
+    theme(plot.title.position = 'plot',
+          plot.title = element_text(hjust = .5),
+          plot.subtitle = element_text(hjust = .5)) +
+    guides(fill = guide_legend(reverse = T)) +
+    theme(axis.ticks.x = element_blank(),
+          axis.text.x = element_blank())
+  ggsave(paste0("../plots/themes/", nt, '.jpg'),
+             units = 'in', device = 'jpg', height = 9 * .6667, width = 13.5 * .6667)
+}
+
+map(lda.models, plot_topics)
+```
+
